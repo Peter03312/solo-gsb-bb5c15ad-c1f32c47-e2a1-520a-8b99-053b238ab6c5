@@ -2,6 +2,7 @@
 
 运行：python -m tests.test_reconciliations
 """
+import json
 import os
 import tempfile
 import threading
@@ -683,6 +684,184 @@ check("对账 receive 事件不挂 batch_id（经对账明细追溯）",
       db_scalar("SELECT COUNT(*) FROM custody_event ce"
                 " JOIN batch_reconciliation_item ri ON ri.event_row_id = ce.id"
                 " WHERE ce.batch_id IS NOT NULL") == 0)
+
+# ---------------------------------------------------------------- 11. 回执固化：纠错后同号重试返回首次提交回执
+print("11) 回执固化：收妥事件被作废/替换后，同号同内容重试仍返回首次提交的回执")
+for c in ("F1", "F2", "F3"):
+    reg(c)
+make_batch("BATCH-F", codes=("F1", "F2", "F3"), prefix="FT")
+body_f = rec_body("REC-F", items=[recv_item("F1", "F-R1"), recv_item("F2", "F-R2"), exc_item("F3")])
+r_first = recon("BATCH-F", body_f)
+check("前置对账 201", r_first.status_code == 201, r_first.text)
+first_receipt = r_first.json()["reconciliation"]
+check("首次回执：收妥事件有效、核验结果与版本号为提交时点",
+      all(i["event_effective"] is True for i in first_receipt["items"][:2])
+      and first_receipt["items"][0]["evaluation"]["current_version"] == 2
+      and first_receipt["items"][0]["evaluation"]["current_custodian"] == "李四",
+      str(first_receipt["items"][0]))
+
+# 收妥事件被作废 / 替换纠错（各使样本版本 +1）
+cr = client.post(f"{API}/corrections", json={
+    "correction_id": "FIX-F1", "sample_code": "F1", "target_event_id": "F-R1",
+    "action": "void", "operator": "质控员", "reason": "签收复核异常，作废"})
+check("作废 F1 收妥事件 201", cr.status_code == 201, cr.text)
+cr = client.post(f"{API}/corrections", json={
+    "correction_id": "FIX-F2", "sample_code": "F2", "target_event_id": "F-R2",
+    "action": "replace", "operator": "质控员", "reason": "签收要素录错，替换",
+    "new_event": {"event_id": "F-R2-FIX", "event_type": "receive",
+                  "occurred_at": "2026-09-30T03:10:00Z",
+                  "transfer_no": "TR-F2", "receiver": "李四", "seal_no": "SEAL-F2"}})
+check("替换 F2 收妥事件 201", cr.status_code == 201, cr.text)
+
+# 同号同内容重试 → 返回首次提交时固化的回执，不混入纠错后状态
+r_retry = recon("BATCH-F", body_f)
+check("纠错后同号同内容重试 200 idempotent=true",
+      r_retry.status_code == 200 and r_retry.json()["idempotent"] is True, r_retry.text)
+check("重试回执与首次提交完全一致（对账头 + 逐份明细 + 当时核验结果/版本号）",
+      r_retry.json()["reconciliation"] == first_receipt,
+      json.dumps(r_retry.json()["reconciliation"], ensure_ascii=False)[:300])
+it_f1 = r_retry.json()["reconciliation"]["items"][0]
+check("重试回执保持提交时点状态（event_effective=true、版本不随纠错增长、保管人不变）",
+      it_f1["event_effective"] is True and it_f1["superseded_by"] is None
+      and it_f1["current_event_id"] == "F-R1"
+      and it_f1["evaluation"]["current_version"] == 2
+      and it_f1["evaluation"]["current_custodian"] == "李四", str(it_f1))
+
+# 清单换序 + 等价时区时间仍视为同内容 → 同一固化回执
+body_f_tz = {"reconciliation_no": "REC-F", "receiver": "李四",
+             "occurred_at": "2026-09-30T11:00:00+08:00",
+             "items": [exc_item("F3"), recv_item("F2", "F-R2"), recv_item("F1", "F-R1")]}
+r_tz = recon("BATCH-F", body_f_tz)
+check("换序 + 等价时区重试 200 且返回同一固化回执",
+      r_tz.status_code == 200 and r_tz.json()["reconciliation"] == first_receipt, r_tz.text)
+
+# 普通对账查询：仍实时反映纠错后的有效性与样本当前核验状态（不受回执固化影响）
+d_live = get_recon("BATCH-F").json()["reconciliation"]
+live_f1 = next(i for i in d_live["items"] if i["sample_code"] == "F1")
+live_f2 = next(i for i in d_live["items"] if i["sample_code"] == "F2")
+check("查询实时反映 F1 收妥已作废（event_effective=false / current_event_id=null）",
+      live_f1["event_effective"] is False and live_f1["superseded_by"] == "FIX-F1"
+      and live_f1["current_event_id"] is None, str(live_f1))
+check("查询实时反映 F2 替换后继与当前版本（与固化回执不同）",
+      live_f2["event_effective"] is False and live_f2["current_event_id"] == "F-R2-FIX"
+      and live_f2["evaluation"]["current_version"] == 3
+      and d_live != first_receipt, str(live_f2))
+check("查询留痕不改写：原事件号/实核封签/份数仍如首次提交",
+      live_f1["event_id"] == "F-R1" and live_f1["verified_seal_no"] == "SEAL-F1"
+      and d_live["received_count"] == 2 and d_live["exception_count"] == 1, str(d_live))
+
+# 异内容 / 跨批次复用 / 新单号规则不受回执固化影响
+check("同号异内容仍 409 reconciliation_conflict",
+      recon("BATCH-F", rec_body("REC-F", items=[recv_item("F1", "F-R1"), recv_item("F2", "F-R2"),
+                                                exc_item("F3", "改动原因")])).status_code == 409)
+check("新单号重提仍 409 batch_already_reconciled",
+      recon("BATCH-F", rec_body("REC-F-NEW", items=[recv_item("F1", "F-R1B"),
+                                                    recv_item("F2", "F-R2B"),
+                                                    exc_item("F3")])).status_code == 409)
+
+# 固化回执与对账记录同事务落库，内容与首次响应一致
+stored = db_scalar("SELECT receipt_json FROM batch_reconciliation WHERE reconciliation_no='REC-F'")
+check("固化回执已随提交事务落库且与首次响应一致",
+      stored is not None and json.loads(stored) == first_receipt)
+
+# ---------------------------------------------------------------- 12. 旧成功单：无固化回执不伪造，同号幂等回退实时视图
+print("12) 旧成功单（receipt_json 为 NULL）：同号幂等保持，回退实时视图，不伪造历史回执")
+for c in ("L1", "L2"):
+    reg(c)
+make_batch("BATCH-L", codes=("L1", "L2"), prefix="LT")
+body_l = rec_body("REC-L", items=[recv_item("L1", "L-R1"), recv_item("L2", "L-R2")])
+r = recon("BATCH-L", body_l)
+check("前置对账 201", r.status_code == 201, r.text)
+# 模拟升级前的旧成功单：无固化回执（receipt_json 为 NULL）
+with db_session(immediate=True) as conn:
+    conn.execute("UPDATE batch_reconciliation SET receipt_json = NULL"
+                 " WHERE reconciliation_no = 'REC-L'")
+cr = client.post(f"{API}/corrections", json={
+    "correction_id": "FIX-L1", "sample_code": "L1", "target_event_id": "L-R1",
+    "action": "void", "operator": "质控员", "reason": "旧单签收异常，作废"})
+check("作废 L1 收妥事件 201", cr.status_code == 201, cr.text)
+r_legacy = recon("BATCH-L", body_l)
+check("旧成功单同号同内容重试仍 200 幂等",
+      r_legacy.status_code == 200 and r_legacy.json()["idempotent"] is True, r_legacy.text)
+legacy_item = next(i for i in r_legacy.json()["reconciliation"]["items"]
+                   if i["sample_code"] == "L1")
+check("无固化回执不伪造：重试回退实时视图（反映作废后状态）",
+      legacy_item["event_effective"] is False and legacy_item["superseded_by"] == "FIX-L1",
+      str(legacy_item))
+check("重试不回填回执（库中仍为 NULL，不伪造缺失的历史回执）",
+      db_scalar("SELECT receipt_json IS NULL FROM batch_reconciliation"
+                " WHERE reconciliation_no='REC-L'") == 1)
+check("旧成功单查询保持可查（200，实时视图）",
+      get_recon("BATCH-L").status_code == 200
+      and get_recon("BATCH-L").json()["reconciliation"]["reconciliation_no"] == "REC-L")
+check("旧成功单同号异内容仍 409 reconciliation_conflict",
+      recon("BATCH-L", rec_body("REC-L", items=[recv_item("L1", "L-R1"),
+                                                exc_item("L2", "改动")])).status_code == 409)
+
+# ---------------------------------------------------------------- 13. 整单失败不占号、不留部分回执
+print("13) 整单失败：不占签收单号、不留对账记录或部分回执；成功单回执与事件/版本同事务")
+for c in ("G1", "G2"):
+    reg(c)
+make_batch("BATCH-G", codes=("G1", "G2"), prefix="GT")
+r = recon("BATCH-G", {"reconciliation_no": "REC-G", "receiver": "李四",
+                      "occurred_at": "2026-09-30T03:00:00Z",
+                      "items": [recv_item("G1", "G-R1")]})  # 缺 G2 → 整单 422
+check("缺项整单 422", r.status_code == 422, r.text)
+check("失败单不占号、无任何对账行（含回执）",
+      db_scalar("SELECT COUNT(*) FROM batch_reconciliation WHERE reconciliation_no='REC-G'") == 0)
+r = recon("BATCH-G", {"reconciliation_no": "REC-G", "receiver": "李四",
+                      "occurred_at": "2026-09-30T03:00:00Z",
+                      "items": [recv_item("G1", "G-R1"), recv_item("G2", "GT-G2")]})  # 事件号占用 → 409
+check("事件号占用整单 409", r.status_code == 409, r.text)
+check("409 失败同样不占号、不留回执",
+      db_scalar("SELECT COUNT(*) FROM batch_reconciliation WHERE reconciliation_no='REC-G'") == 0
+      and db_scalar("SELECT COUNT(*) FROM custody_event WHERE event_id='G-R1'") == 0)
+# 修正后同号成功：回执与收妥事件、样本版本同事务落库
+r = recon("BATCH-G", {"reconciliation_no": "REC-G", "receiver": "李四",
+                      "occurred_at": "2026-09-30T03:00:00Z",
+                      "items": [recv_item("G1", "G-R1"), recv_item("G2", "G-R2")]})
+check("失败单号修正后成功 201", r.status_code == 201, r.text)
+check("成功单回执已固化、收妥事件与版本同事务存在",
+      db_scalar("SELECT receipt_json IS NOT NULL FROM batch_reconciliation"
+                " WHERE reconciliation_no='REC-G'") == 1
+      and db_scalar("SELECT COUNT(*) FROM custody_event WHERE event_id IN ('G-R1','G-R2')") == 2
+      and versions("G1")["current_version"] == 2 and versions("G2")["current_version"] == 2)
+check("成功单同号重试返回固化回执",
+      recon("BATCH-G", {"reconciliation_no": "REC-G", "receiver": "李四",
+                        "occurred_at": "2026-09-30T03:00:00Z",
+                        "items": [recv_item("G2", "G-R2"), recv_item("G1", "G-R1")]}).json()
+      ["reconciliation"] == r.json()["reconciliation"])
+# 全异常对账（无收妥事件）同样固化回执
+for c in ("H1", "H2"):
+    reg(c)
+make_batch("BATCH-H", codes=("H1", "H2"), prefix="HT")
+body_h = rec_body("REC-H", items=[exc_item("H1", "车次延误"), exc_item("H2", "封签缺失")])
+r_h = recon("BATCH-H", body_h)
+check("全异常对账 201 且回执固化",
+      r_h.status_code == 201
+      and db_scalar("SELECT receipt_json IS NOT NULL FROM batch_reconciliation"
+                    " WHERE reconciliation_no='REC-H'") == 1, r_h.text)
+check("全异常同号重试返回首次回执",
+      recon("BATCH-H", body_h).json()["reconciliation"] == r_h.json()["reconciliation"])
+# 成功对账后样本再核定：重试回执仍为核定前提交时点（evaluation 未核定、版本不增）
+ev({"event_id": "G1-C", "event_type": "seal_check", "sample_code": "G1",
+    "occurred_at": "2026-09-30T03:30:00Z", "checked_seal_no": "SEAL-G1", "seal_intact": True})
+ev({"event_id": "G1-S", "event_type": "storage", "sample_code": "G1",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+ar = client.post(f"{API}/samples/G1/approve", json={"approver": "质量主管"})
+check("对账成功后 G1 补齐链并核定", ar.status_code == 200, ar.text)
+r_g = recon("BATCH-G", {"reconciliation_no": "REC-G", "receiver": "李四",
+                        "occurred_at": "2026-09-30T03:00:00Z",
+                        "items": [recv_item("G1", "G-R1"), recv_item("G2", "G-R2")]})
+g1_frozen = next(i for i in r_g.json()["reconciliation"]["items"] if i["sample_code"] == "G1")
+check("核定后同号重试回执仍为提交时点（未核定状态、版本 2）",
+      r_g.status_code == 200 and g1_frozen["evaluation"]["approved_storage_at"] is None
+      and g1_frozen["evaluation"]["current_version"] == 2, str(g1_frozen["evaluation"]))
+g1_live = next(i for i in get_recon("BATCH-G").json()["reconciliation"]["items"]
+               if i["sample_code"] == "G1")
+check("查询实时反映核定后状态（approved_storage_at 非空、版本递增）",
+      g1_live["evaluation"]["approved_storage_at"] is not None
+      and g1_live["evaluation"]["current_version"] > 2, str(g1_live["evaluation"]))
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 raise SystemExit(1 if FAIL else 0)

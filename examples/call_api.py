@@ -383,6 +383,31 @@ def main() -> None:
     s, r = call("GET", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation")
     show("对账查询（收妥/异常明细 + 现时有效性）", s, r, "reconciliation", "reconciliation_no")
 
+    # 12.6b) 回执固化：收妥事件被作废纠错后，同单号同内容重试仍返回首次提交时的回执；
+    #        普通对账查询则实时反映纠错后的有效性（两条视图各司其职）
+    first_receipt = call("POST", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation",
+                         recon_body)[1].get("reconciliation", {})
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-FIX-RECV-{run_r}",
+        "sample_code": r_codes[0],
+        "target_event_id": f"API-RECV-{run_r}-1",
+        "action": "void",
+        "operator": "质控员",
+        "reason": "对账签收后发现封签复核异常，作废签收",
+    })
+    show("作废收妥事件（201）", s, r, "correction", "correction_id")
+    s, r = call("POST", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation", recon_body)
+    frozen = r.get("reconciliation", {})
+    same = frozen == first_receipt
+    print(f"\n--- 纠错后同单号同内容重试 [HTTP {s}] idempotent={r.get('idempotent')} ---")
+    print(f"    回执与首次提交完全一致（固化）：{same}"
+          f"（首份 event_effective={frozen.get('items', [{}])[0].get('event_effective')}，仍为提交时点状态）")
+    s, r = call("GET", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation")
+    live0 = (r.get("reconciliation", {}).get("items") or [{}])[0]
+    print(f"--- 对账查询（实时视图）[HTTP {s}] ---")
+    print(f"    首份 event_effective={live0.get('event_effective')}"
+          f" superseded_by={live0.get('superseded_by')}（实时反映作废，留痕不改写原对账）")
+
     # 13) 保管链版本复核（质控）：按样本编号 + 版本号查询当时的结论、原因、保管人与时间线
     print("\n=== 保管链版本复核 ===")
     s, r = call("GET", f"/samples/{code}/versions")
