@@ -536,5 +536,111 @@ try:
 finally:
     restore_db()
 
+# ---------------------------------------------------------------- 7. v2 旧库（已有成功对账、无回执列）升级
+print("7) v2 旧库升级：batch_reconciliation 补 receipt_json 列，旧成功单不伪造回执")
+db7 = os.path.join(_tmp, "upgrade_recon.db")
+use_db(db7)
+try:
+    with TestClient(app) as client:
+        # 造数：两份样本 → 批量移交 → 整批对账签收成功（1 收妥 / 1 异常）
+        for code, seal in (("S-V2-A", "SEAL-V2-A"), ("S-V2-B", "SEAL-V2-B")):
+            r = client.post(f"{API}/samples", json={
+                "sample_code": code, "collected_at": "2026-09-30T01:00:00Z",
+                "collector": "王采集", "seal_no": seal})
+            check(f"{code} 登记 201", r.status_code == 201, r.text)
+        r = client.post(f"{API}/transfer-batches", json={
+            "batch_id": "BATCH-V2", "occurred_at": "2026-09-30T02:00:00Z",
+            "from_custodian": "王采集", "to_custodian": "李运输",
+            "items": [
+                {"sample_code": "S-V2-A", "transfer_no": "TR-V2-A", "event_id": "EVT-V2-TA"},
+                {"sample_code": "S-V2-B", "transfer_no": "TR-V2-B", "event_id": "EVT-V2-TB"}]})
+        check("批量移交 201", r.status_code == 201, r.text)
+        recon_body = {
+            "reconciliation_no": "REC-V2", "receiver": "李运输",
+            "occurred_at": "2026-09-30T03:00:00Z",
+            "items": [
+                {"sample_code": "S-V2-A", "event_id": "EVT-V2-RA",
+                 "verified_seal_no": "SEAL-V2-A"},
+                {"sample_code": "S-V2-B", "reason": "到货封签破损，异常拒收"}]}
+        r = client.post(f"{API}/transfer-batches/BATCH-V2/reconciliation", json=recon_body)
+        check("对账签收 201", r.status_code == 201, r.text)
+
+    # 模拟 v2 旧库：对账表无 receipt_json 列、user_version=2（旧成功单自然无固化回执）
+    with db_session(immediate=True) as conn:
+        conn.execute("ALTER TABLE batch_reconciliation DROP COLUMN receipt_json")
+        conn.execute("PRAGMA user_version = 2")
+    init_db()
+    with db_session() as conn:
+        uv = conn.execute("PRAGMA user_version").fetchone()[0]
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(batch_reconciliation)")]
+        receipt = conn.execute(
+            "SELECT receipt_json FROM batch_reconciliation WHERE reconciliation_no='REC-V2'"
+        ).fetchone()["receipt_json"]
+    check("升级落档到当前版本", uv == SCHEMA_VERSION, str(uv))
+    check("receipt_json 列已补", "receipt_json" in cols, str(cols))
+    check("旧成功单不伪造回执（receipt_json 保持 NULL）", receipt is None, str(receipt))
+
+    with TestClient(app) as client:
+        # 旧成功单：同号同内容重试仍 200 幂等（回退现算视图），GET 可查
+        r = client.post(f"{API}/transfer-batches/BATCH-V2/reconciliation", json=recon_body)
+        check("旧成功单同号同内容重试 200 幂等（回退现算视图）",
+              r.status_code == 200 and r.json()["idempotent"] is True
+              and r.json()["reconciliation"]["reconciliation_no"] == "REC-V2", r.text)
+        check("旧单 GET 查询 200",
+              client.get(f"{API}/transfer-batches/BATCH-V2/reconciliation").status_code == 200)
+        # 收妥事件被作废后：旧单重试反映现时状态（无固化回执可伪造），且不回填回执
+        r = client.post(f"{API}/corrections", json={
+            "correction_id": "FIX-V2-RA", "sample_code": "S-V2-A",
+            "target_event_id": "EVT-V2-RA", "action": "void",
+            "operator": "质控员", "reason": "升级前旧单，作废签收演示"})
+        check("作废旧单收妥事件 201", r.status_code == 201, r.text)
+        r = client.post(f"{API}/transfer-batches/BATCH-V2/reconciliation", json=recon_body)
+        item_a = next(i for i in r.json()["reconciliation"]["items"]
+                      if i["sample_code"] == "S-V2-A")
+        check("旧单重试反映现时有效性（event_effective=false，无伪造回执）",
+              r.status_code == 200 and item_a["event_effective"] is False
+              and item_a["superseded_by"] == "FIX-V2-RA", str(item_a))
+        with db_session() as conn:
+            still_null = conn.execute(
+                "SELECT receipt_json IS NULL FROM batch_reconciliation"
+                " WHERE reconciliation_no='REC-V2'").fetchone()[0]
+        check("旧单重试不回填回执（receipt_json 仍为 NULL）", still_null == 1)
+
+        # 升级后新成功单：回执正常固化，纠错后同号重试返回首次提交回执
+        for code, seal in (("S-V3-A", "SEAL-V3-A"), ("S-V3-B", "SEAL-V3-B")):
+            client.post(f"{API}/samples", json={
+                "sample_code": code, "collected_at": "2026-09-30T01:00:00Z",
+                "collector": "王采集", "seal_no": seal})
+        client.post(f"{API}/transfer-batches", json={
+            "batch_id": "BATCH-V3", "occurred_at": "2026-09-30T02:00:00Z",
+            "from_custodian": "王采集", "to_custodian": "李运输",
+            "items": [
+                {"sample_code": "S-V3-A", "transfer_no": "TR-V3-A", "event_id": "EVT-V3-TA"},
+                {"sample_code": "S-V3-B", "transfer_no": "TR-V3-B", "event_id": "EVT-V3-TB"}]})
+        body_v3 = {"reconciliation_no": "REC-V3", "receiver": "李运输",
+                   "occurred_at": "2026-09-30T03:00:00Z",
+                   "items": [
+                       {"sample_code": "S-V3-A", "event_id": "EVT-V3-RA",
+                        "verified_seal_no": "SEAL-V3-A"},
+                       {"sample_code": "S-V3-B", "reason": "异常拒收"}]}
+        r = client.post(f"{API}/transfer-batches/BATCH-V3/reconciliation", json=body_v3)
+        check("升级后新对账 201", r.status_code == 201, r.text)
+        first = r.json()["reconciliation"]
+        client.post(f"{API}/corrections", json={
+            "correction_id": "FIX-V3-RA", "sample_code": "S-V3-A",
+            "target_event_id": "EVT-V3-RA", "action": "void",
+            "operator": "质控员", "reason": "作废签收演示固化回执"})
+        r = client.post(f"{API}/transfer-batches/BATCH-V3/reconciliation", json=body_v3)
+        check("新单纠错后同号重试返回首次提交回执（完全一致）",
+              r.status_code == 200 and r.json()["reconciliation"] == first, r.text)
+        live = client.get(f"{API}/transfer-batches/BATCH-V3/reconciliation").json()
+        item_a = next(i for i in live["reconciliation"]["items"]
+                      if i["sample_code"] == "S-V3-A")
+        check("新单 GET 查询仍实时反映纠错后有效性",
+              item_a["event_effective"] is False
+              and item_a["superseded_by"] == "FIX-V3-RA", str(item_a))
+finally:
+    restore_db()
+
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 raise SystemExit(1 if FAIL else 0)

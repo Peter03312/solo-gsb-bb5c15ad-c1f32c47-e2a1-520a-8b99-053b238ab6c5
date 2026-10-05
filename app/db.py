@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS transfer_batch_item (
 -- 接收方以全局唯一签收单号、签收人与统一签收时间，逐份提交覆盖原批次全部样本的
 -- 对账清单：收妥项落为既有 receive 事件（与各样本新版本同事务提交），
 -- 异常项仅留对账记录、不生成签收事件。失败整单拒绝且不留任何记录。
+-- 首次提交成功的回执（对账头+逐份明细+当时核验结果）在同一事务内固化到 receipt_json，
+-- 同号同内容重试原样返回；普通对账查询（GET）仍实时反映纠错后有效性。
 CREATE TABLE IF NOT EXISTS batch_reconciliation (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     reconciliation_no TEXT NOT NULL UNIQUE,              -- 全局唯一签收单号（同号重试幂等/异内容冲突）
@@ -88,6 +90,7 @@ CREATE TABLE IF NOT EXISTS batch_reconciliation (
     received_count    INTEGER NOT NULL,                 -- 收妥份数
     exception_count   INTEGER NOT NULL,                 -- 异常份数
     request_hash      TEXT NOT NULL,                    -- 对账请求指纹（同签收单号幂等/冲突判定）
+    receipt_json      TEXT,                             -- 首次提交回执固化（与收妥事件/版本同事务）；NULL=升级前旧成功单（不伪造）
     created_at        TEXT NOT NULL
 );
 
@@ -317,6 +320,11 @@ _MIGRATION_COLUMNS = {
     "review": [
         ("reviewer_person_id", "TEXT"),                # 升级前旧意见保持 NULL，不伪造身份记录
     ],
+    "batch_reconciliation": [
+        # v3：首次提交回执固化列。旧成功单保持 NULL（不伪造缺失的历史回执），
+        # 其同号同内容重试回退现算视图；新成功单在提交事务内写入完整回执。
+        ("receipt_json", "TEXT"),
+    ],
 }
 
 # 启动升级版本号（写入 SQLite user_version，随升级事务一同提交/回滚）：
@@ -324,8 +332,11 @@ _MIGRATION_COLUMNS = {
 # 2 = 为 custody_event / event_correction 增补 hash_gen 指纹代际列：
 #     旧行保持 NULL（不回填、不重算历史指纹），新写入恒为 1，用于区分
 #     “旧版省略 seal_intact 被误落为 false”的历史记录与现行明确提交 false。
+# 3 = 为 batch_reconciliation 增补 receipt_json 首次提交回执固化列：
+#     旧成功单保持 NULL（不伪造缺失的历史回执，同号同内容重试回退现算视图），
+#     新成功单在提交事务内与收妥事件、样本版本一同写入完整回执。
 # 已完成的库（user_version >= SCHEMA_VERSION）启动时直接沿用，不重复执行。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utcnow_iso() -> str:

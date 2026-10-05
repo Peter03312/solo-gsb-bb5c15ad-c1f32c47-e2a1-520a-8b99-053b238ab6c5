@@ -383,6 +383,30 @@ def main() -> None:
     s, r = call("GET", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation")
     show("对账查询（收妥/异常明细 + 现时有效性）", s, r, "reconciliation", "reconciliation_no")
 
+    # 首次回执固化：收妥事件被作废纠错后，同单号同内容重试仍返回首次提交回执；
+    # 普通对账查询（GET）实时反映纠错后的现时有效性
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-FIX-RECV-{run_r}",
+        "sample_code": r_codes[0],
+        "target_event_id": f"API-RECV-{run_r}-1",
+        "action": "void",
+        "operator": "质控员",
+        "reason": "对账签收后复核发现异常，作废该收妥事件",
+    })
+    show("作废一份对账收妥事件（纠错）", s, r, "evaluation", "status")
+    s, r = call("POST", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation", recon_body)
+    print(f"\n--- 纠错后同单号同内容重试 [HTTP {s}]：返回首次提交回执（固化） ---")
+    for it in r.get("reconciliation", {}).get("items", []):
+        print(f"    回执 {it['sample_code']}: 事件={it['event_id']}"
+              f" 收妥事件有效={it['event_effective']} 结论={it['evaluation']['status']}"
+              f" 版本={it['evaluation']['current_version']}")
+    s, r = call("GET", f"/transfer-batches/API-RECON-BATCH-{run_r}/reconciliation")
+    print(f"--- 对账查询 GET [HTTP {s}]：实时反映纠错后状态 ---")
+    for it in r.get("reconciliation", {}).get("items", []):
+        print(f"    查询 {it['sample_code']}: 事件={it['event_id']}"
+              f" 收妥事件有效={it['event_effective']} 当前有效事件={it['current_event_id']}"
+              f" 结论={it['evaluation']['status']} 版本={it['evaluation']['current_version']}")
+
     # 13) 保管链版本复核（质控）：按样本编号 + 版本号查询当时的结论、原因、保管人与时间线
     print("\n=== 保管链版本复核 ===")
     s, r = call("GET", f"/samples/{code}/versions")

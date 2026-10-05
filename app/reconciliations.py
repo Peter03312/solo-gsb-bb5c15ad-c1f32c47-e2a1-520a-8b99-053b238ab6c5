@@ -10,12 +10,19 @@
   * 历史冻结：批内任一样本已核定入库，无论其按收妥项还是异常项提交，均整单 409
     （reconciliation_rejected / sample_approved）拒绝——异常项仅填原因也不得绕过冻结；
   * 批次不存在、缺项/重复/外来项、事件号占用、任一收妥项不合格 → 整单拒绝且不留记录；
-  * 一个批次只能成功对账一次；同签收单号同内容重试返回原结果（200 幂等），
-    异内容（含跨批次复用单号）→ 409 reconciliation_conflict；
+  * 一个批次只能成功对账一次；同签收单号同内容重试返回**首次提交时固化的回执**
+    （200 幂等：对账头、逐份明细与当时核验结果/版本号原样返回，不混入其后纠错
+    导致的收妥事件有效性、核验结论与版本号变化），异内容（含跨批次复用单号）
+    → 409 reconciliation_conflict；
     批次已对账再以新单号提交 → 409 batch_already_reconciled；
     写事务 BEGIN IMMEDIATE 串行，并发按已提交状态判定（批次唯一键/单号唯一键兜底）；
-  * 查询只呈现：当时的收妥/异常明细（留痕不改写）与各收妥事件的现时有效性
-    （作废/替换后 event_effective/current_event_id 反映有效链）。
+  * 首次提交成功时，回执（对账头+逐份明细+当时核验结果）与收妥事件、样本版本在
+    同一事务内固化（receipt_json）；整单失败不占签收单号、不留部分回执；
+  * 普通对账查询（GET）只呈现：当时的收妥/异常明细（留痕不改写）与各收妥事件的
+    现时有效性（作废/替换后 event_effective/current_event_id 反映有效链）及各份
+    当前核验结论——实时反映纠错结果，与固化回执互不影响；
+  * 升级前的旧成功单无固化回执（receipt_json 为 NULL）：保持可查与同号幂等，
+    重试回退现算视图——不伪造缺失的历史回执。
 """
 import json
 import sqlite3
@@ -87,6 +94,19 @@ def _evaluation_with_version(conn: sqlite3.Connection, sample: sqlite3.Row) -> d
     result = evaluation_summary(evaluate(conn, sample), sample)
     result["current_version"] = latest_version_no(conn, sample["id"])
     return result
+
+
+def _retry_view(conn: sqlite3.Connection, recon_row: sqlite3.Row, batch_id: str) -> dict[str, Any]:
+    """同签收单号同内容重试的回执。
+
+    首次提交成功的回执已与收妥事件、样本版本同事务固化（receipt_json）：重试原样
+    返回首次提交时的对账头、逐份明细与核验结果，不混入其后纠错导致的收妥事件
+    有效性、核验结论与版本号变化。升级前的旧成功单无固化回执（receipt_json 为
+    NULL）——不伪造缺失的历史回执，回退现算视图（与旧行为一致）。
+    """
+    if recon_row["receipt_json"] is not None:
+        return json.loads(recon_row["receipt_json"])
+    return get_batch_reconciliation(conn, batch_id)
 
 
 def _validate_received_item(
@@ -169,10 +189,11 @@ def _validate_received_item(
 def submit_batch_reconciliation(
     conn: sqlite3.Connection, batch_id: str, data: BatchReconciliationIn
 ) -> tuple[dict[str, Any], bool]:
-    """提交整批对账签收。返回 (对账查询视图, 是否幂等重试)。
+    """提交整批对账签收。返回 (对账响应视图, 是否幂等重试)。
 
-    全部校验通过后：收妥项 receive 事件 + 各样本新版本 + 对账头/明细同一事务提交，
-    异常项仅写对账明细；任一不合格整单回滚不留记录。
+    全部校验通过后：收妥项 receive 事件 + 各样本新版本 + 对账头/明细 + 首次提交
+    回执固化，同一事务提交；异常项仅写对账明细；任一不合格整单回滚不留记录
+    （不占签收单号、不留部分回执）。
     """
     occurred_iso, request_hash = _reconciliation_fingerprint(batch_id, data)
 
@@ -197,7 +218,8 @@ def submit_batch_reconciliation(
                  "existing_request_hash": existing_no["request_hash"],
                  "incoming_request_hash": request_hash},
             )
-        return get_batch_reconciliation(conn, existing_batch["batch_id"]), True
+        # 同号同内容：返回首次提交时固化的回执（旧成功单无固化回执则回退现算视图）
+        return _retry_view(conn, existing_no, existing_batch["batch_id"]), True
 
     # 3) 一个批次只能成功对账一次
     existing_batch_recon = conn.execute(
@@ -350,7 +372,7 @@ def submit_batch_reconciliation(
                     "SELECT batch_id FROM transfer_batch WHERE id = ?", (race_no["batch_pk"],)
                 ).fetchone()
                 if race_batch["batch_id"] == batch_id:
-                    return get_batch_reconciliation(conn, batch_id), True
+                    return _retry_view(conn, race_no, batch_id), True
             raise DomainError(
                 409, "reconciliation_conflict",
                 f"签收单号 {data.reconciliation_no} 并发写入且内容冲突",
@@ -442,7 +464,16 @@ def submit_batch_reconciliation(
     for _, _, received_sample, _ in accepted_received:
         track_sample_evidence_committed(conn, received_sample)
 
-    return get_batch_reconciliation(conn, batch_id), False
+    # 首次提交回执固化：对账头+逐份明细+当时核验结果（含版本号、收妥事件有效性）
+    # 与收妥事件、样本新版本、对账头/明细在同一事务内写入。此后同号同内容重试原样
+    # 返回本回执，不混入其后纠错变化；普通对账查询（GET）仍实时反映现时状态。
+    # 整单失败在上方已整体回滚——不占签收单号，也不留部分回执。
+    receipt = get_batch_reconciliation(conn, batch_id)
+    conn.execute(
+        "UPDATE batch_reconciliation SET receipt_json = ? WHERE id = ?",
+        (json.dumps(receipt, ensure_ascii=False, separators=(",", ":")), recon_pk),
+    )
+    return receipt, False
 
 
 def _reconciliation_item_view(

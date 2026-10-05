@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核、人员标识复核回避、运输测温证据复核与设备校准可信复核",
-    version="1.12.0",
+    version="1.13.0",
     lifespan=lifespan,
 )
 
@@ -282,7 +282,10 @@ def submit_batch_reconciliation_api(batch_id: str, data: BatchReconciliationIn) 
       409 reconciliation_rejected（明细 sample_approved），不留对账记录、签收事件或新版本；
     * 批次不存在、缺项/重复/外来项、事件号占用、任一收妥项不合格 → 整单拒绝且不留记录
       （409 reconciliation_rejected=已核定/事件号占用；422=清单不合法/收妥项不合格，逐项给出）；
-    * 同签收单号同内容重试 → 200 幂等返回原结果；异内容（含跨批次）→ 409 reconciliation_conflict；
+    * 首次提交成功时，回执（对账头、逐份明细、当时核验结果与版本号）与收妥事件、样本版本
+      同事务固化：同签收单号同内容重试 → 200 原样返回首次回执，不混入其后纠错变化；
+      升级前旧成功单无固化回执，同号同内容重试回退现算视图（不伪造历史回执）；
+      异内容（含跨批次）→ 409 reconciliation_conflict；
     * 一个批次只能成功对账一次：批次已对账再提交 → 409 batch_already_reconciled；
     * 并发由 BEGIN IMMEDIATE 串行，按已提交状态判定。
     """
@@ -294,7 +297,8 @@ def submit_batch_reconciliation_api(batch_id: str, data: BatchReconciliationIn) 
 
 @app.get(f"{API_PREFIX}/transfer-batches/{{batch_id}}/reconciliation", tags=["reconciliations"])
 def get_batch_reconciliation_api(batch_id: str) -> dict[str, Any]:
-    """批次对账查询：当时的收妥/异常明细（原样留痕）与各收妥事件纠错后的现时有效性。"""
+    """批次对账查询：当时的收妥/异常明细（原样留痕）与各收妥事件纠错后的现时有效性、
+    各份当前核验结论（实时重算，不受首次提交固化回执影响）。"""
     with db_session() as conn:
         return {"reconciliation": get_batch_reconciliation(conn, batch_id)}
 
